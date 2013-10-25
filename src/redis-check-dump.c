@@ -140,6 +140,9 @@ static double R_Zero, R_PosInf, R_NegInf, R_Nan;
 /* store string types for output */
 static char types[256][16];
 
+/* support for check AOFv2 db */
+static int checkaof = 0;
+
 /* Prototypes */
 uint64_t crc64(uint64_t crc, const unsigned char *s, uint64_t l);
 
@@ -508,7 +511,7 @@ entry loadEntry() {
             return e;
         }
     } else if (e.type == REDIS_EOF) {
-        if (positions[level].offset < positions[level].size) {
+        if (!checkaof && positions[level].offset < positions[level].size) {
             SHIFT_ERROR(offset[0], "Unexpected EOF");
         } else {
             e.success = 1;
@@ -660,6 +663,9 @@ void process() {
             positions[0] = positions[1];
         }
         free(entry.key);
+
+        /* Break on EOF */
+        if (entry.success && entry.type == REDIS_EOF) break;
     }
 
     /* because there is another potential error,
@@ -681,9 +687,9 @@ void process() {
 
     /* Verify checksum */
     if (dump_version >= 5) {
-        uint64_t crc = crc64(0,positions[0].data,positions[0].size);
+        uint64_t crc = crc64(0,positions[0].data,positions[0].offset);
         uint64_t crc2;
-        unsigned char *p = (unsigned char*)positions[0].data+positions[0].size;
+        unsigned char *p = (unsigned char*)positions[0].data+positions[0].offset;
         crc2 = ((uint64_t)p[0] << 0) |
                ((uint64_t)p[1] << 8) |
                ((uint64_t)p[2] << 16) |
@@ -697,6 +703,13 @@ void process() {
         } else {
             printf("CRC64 checksum is OK\n");
         }
+        /* shift offset */
+        positions[0].offset += 8;
+    }
+
+    /* print aof offset for redis-check-aof */
+    if (checkaof) {
+        printf("AOFv2: aof offset at %lld\n", (long long) positions[0].offset);
     }
 
     /* print summary on errors */
@@ -707,19 +720,32 @@ void process() {
     }
 }
 
+static void usage() {
+    printf("Usage: redis-check-dump [--aof] <dump.rdb>\n");
+    exit(0);
+}
+
 int main(int argc, char **argv) {
-    /* expect the first argument to be the dump file */
-    if (argc <= 1) {
-        printf("Usage: %s <dump.rdb>\n", argv[0]);
-        exit(0);
+    char *filename;
+    int i = 0;
+
+    for (i = 1; i < argc && *argv[i] == '-'; i++) {
+        if (!strcmp(argv[i],"--aof")) {
+            checkaof = 1;
+        } else {
+            usage();
+        }
     }
+
+    if (argc-i < 1) usage();
+    filename = argv[i];
 
     int fd;
     off_t size;
     struct stat stat;
     void *data;
 
-    fd = open(argv[1], O_RDONLY);
+    fd = open(filename, O_RDONLY);
     if (fd < 1) {
         ERROR("Cannot open file: %s\n", argv[1]);
     }

@@ -146,26 +146,29 @@ off_t process(FILE *fp) {
     return pos;
 }
 
+static void usage() {
+    printf("Usage: redis-check-aof [--fix] [--skip n] <file.aof>\n");
+    exit(0);
+}
+
 int main(int argc, char **argv) {
     char *filename;
     int fix = 0;
+    size_t offs = 0;
+    int i = 0;
 
-    if (argc < 2) {
-        printf("Usage: %s [--fix] <file.aof>\n", argv[0]);
-        exit(1);
-    } else if (argc == 2) {
-        filename = argv[1];
-    } else if (argc == 3) {
-        if (strcmp(argv[1],"--fix") != 0) {
-            printf("Invalid argument: %s\n", argv[1]);
-            exit(1);
+    for (i = 1; i < argc && *argv[i] == '-'; i++) {
+        if (!strcmp(argv[i],"--fix")) {
+            fix = 1;
+        } else if (!strcmp(argv[i],"--skip")) {
+            offs = atoll(argv[++i]);
+        } else {
+            usage();
         }
-        filename = argv[2];
-        fix = 1;
-    } else {
-        printf("Invalid arguments\n");
-        exit(1);
     }
+
+    if (argc-i < 1) usage();
+    filename = argv[i];
 
     FILE *fp = fopen(filename,"r+");
     if (fp == NULL) {
@@ -182,6 +185,11 @@ int main(int argc, char **argv) {
     off_t size = sb.st_size;
     if (size == 0) {
         printf("Empty file: %s\n", filename);
+        exit(1);
+    }
+
+    if (offs > 0 && fseek(fp, offs, SEEK_SET) == -1) {
+        printf("Cannot seek file: %s\n", filename);
         exit(1);
     }
 
