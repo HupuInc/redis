@@ -289,6 +289,11 @@ void loadServerConfigFromString(char *config) {
         } else if (!strcasecmp(argv[0],"appendfilename") && argc == 2) {
             zfree(server.aof_filename);
             server.aof_filename = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"appendformatv2")
+                   && argc == 2) {
+            if ((server.aof_format_v2= yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"no-appendfsync-on-rewrite")
                    && argc == 2) {
             if ((server.aof_no_fsync_on_rewrite= yesnotoi(argv[1])) == -1) {
@@ -548,6 +553,11 @@ void configSetCommand(redisClient *c) {
         } else {
             goto badfmt;
         }
+    } else if (!strcasecmp(c->argv[2]->ptr,"appendformatv2")) {
+        int yn = yesnotoi(o->ptr);
+
+        if (yn == -1) goto badfmt;
+        server.aof_format_v2 = yn;
     } else if (!strcasecmp(c->argv[2]->ptr,"no-appendfsync-on-rewrite")) {
         int yn = yesnotoi(o->ptr);
 
@@ -844,6 +854,8 @@ void configGetCommand(redisClient *c) {
     config_get_numerical_field("hz",server.hz);
 
     /* Bool (yes/no) values */
+    config_get_bool_field("appendformatv2",
+            server.aof_format_v2);
     config_get_bool_field("no-appendfsync-on-rewrite",
             server.aof_no_fsync_on_rewrite);
     config_get_bool_field("slave-serve-stale-data",

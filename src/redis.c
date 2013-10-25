@@ -1249,6 +1249,7 @@ void initServerConfig() {
     server.daemonize = 0;
     server.aof_state = REDIS_AOF_OFF;
     server.aof_fsync = AOF_FSYNC_EVERYSEC;
+    server.aof_format_v2 = 0;
     server.aof_no_fsync_on_rewrite = 0;
     server.aof_rewrite_perc = REDIS_AOF_REWRITE_PERC;
     server.aof_rewrite_min_size = REDIS_AOF_REWRITE_MIN_SIZE;

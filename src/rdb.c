@@ -627,24 +627,14 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
 }
 
 /* Save the DB on disk. Return REDIS_ERR on error, REDIS_OK on success */
-int rdbSave(char *filename) {
+int rdbSaveTo(FILE *fp) {
     dictIterator *di = NULL;
     dictEntry *de;
-    char tmpfile[256];
     char magic[10];
     int j;
     long long now = mstime();
-    FILE *fp;
     rio rdb;
     uint64_t cksum;
-
-    snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
-    fp = fopen(tmpfile,"w");
-    if (!fp) {
-        redisLog(REDIS_WARNING, "Failed opening .rdb for saving: %s",
-            strerror(errno));
-        return REDIS_ERR;
-    }
 
     rioInitWithFile(&rdb,fp);
     if (server.rdb_checksum)
@@ -657,10 +647,7 @@ int rdbSave(char *filename) {
         dict *d = db->dict;
         if (dictSize(d) == 0) continue;
         di = dictGetSafeIterator(d);
-        if (!di) {
-            fclose(fp);
-            return REDIS_ERR;
-        }
+        if (!di) goto err;
 
         /* Write the SELECT DB opcode */
         if (rdbSaveType(&rdb,REDIS_RDB_OPCODE_SELECTDB) == -1) goto werr;
@@ -692,6 +679,30 @@ int rdbSave(char *filename) {
     /* Make sure data will not remain on the OS's output buffers */
     fflush(fp);
     fsync(fileno(fp));
+
+    return REDIS_OK;
+
+werr:
+    redisLog(REDIS_WARNING,"Write error saving DB on disk: %s", strerror(errno));
+err:
+    if (di) dictReleaseIterator(di);
+    return REDIS_ERR;
+}
+
+/* Save the DB on disk. Return REDIS_ERR on error, REDIS_OK on success */
+int rdbSave(char *filename) {
+    char tmpfile[256];
+    FILE *fp;
+
+    snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
+    fp = fopen(tmpfile,"w");
+    if (!fp) {
+        redisLog(REDIS_WARNING, "Failed opening .rdb for saving: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    if (rdbSaveTo(fp) != REDIS_OK) goto werr;
     fclose(fp);
 
     /* Use RENAME to make sure the DB file is changed atomically only
@@ -710,8 +721,6 @@ int rdbSave(char *filename) {
 werr:
     fclose(fp);
     unlink(tmpfile);
-    redisLog(REDIS_WARNING,"Write error saving DB on disk: %s", strerror(errno));
-    if (di) dictReleaseIterator(di);
     return REDIS_ERR;
 }
 
@@ -1059,17 +1068,16 @@ void stopLoading(void) {
     server.loading = 0;
 }
 
-int rdbLoad(char *filename) {
+/* Load db from stream, with progress support */
+int rdbLoadFrom(FILE *fp) {
     uint32_t dbid;
     int type, rdbver;
     redisDb *db = server.db+0;
     char buf[1024];
     long long expiretime, now = mstime();
     long loops = 0;
-    FILE *fp;
     rio rdb;
-
-    if ((fp = fopen(filename,"r")) == NULL) return REDIS_ERR;
+    int loading = server.loading;
 
     rioInitWithFile(&rdb,fp);
     if (server.rdb_checksum)
@@ -1077,20 +1085,18 @@ int rdbLoad(char *filename) {
     if (rioRead(&rdb,buf,9) == 0) goto eoferr;
     buf[9] = '\0';
     if (memcmp(buf,"REDIS",5) != 0) {
-        fclose(fp);
         redisLog(REDIS_WARNING,"Wrong signature trying to load DB from file");
         errno = EINVAL;
         return REDIS_ERR;
     }
     rdbver = atoi(buf+5);
     if (rdbver < 1 || rdbver > REDIS_RDB_VERSION) {
-        fclose(fp);
         redisLog(REDIS_WARNING,"Can't handle RDB format version %d",rdbver);
         errno = EINVAL;
         return REDIS_ERR;
     }
 
-    startLoading(fp);
+    if (!loading) startLoading(fp);
     while(1) {
         robj *key, *val;
         expiretime = -1;
@@ -1155,27 +1161,38 @@ int rdbLoad(char *filename) {
         decrRefCount(key);
     }
     /* Verify the checksum if RDB version is >= 5 */
-    if (rdbver >= 5 && server.rdb_checksum) {
+    if (rdbver >= 5) {
         uint64_t cksum, expected = rdb.cksum;
 
         if (rioRead(&rdb,&cksum,8) == 0) goto eoferr;
-        memrev64ifbe(&cksum);
-        if (cksum == 0) {
-            redisLog(REDIS_WARNING,"RDB file was saved with checksum disabled: no check performed.");
-        } else if (cksum != expected) {
-            redisLog(REDIS_WARNING,"Wrong RDB checksum. Aborting now.");
-            exit(1);
+        if (server.rdb_checksum) {
+            memrev64ifbe(&cksum);
+            if (cksum == 0) {
+                redisLog(REDIS_WARNING,"RDB file was saved with checksum disabled: no check performed.");
+            } else if (cksum != expected) {
+                redisLog(REDIS_WARNING,"Wrong RDB checksum. Aborting now.");
+                exit(1);
+            }
         }
     }
 
-    fclose(fp);
-    stopLoading();
+    if (!loading) stopLoading();
     return REDIS_OK;
 
 eoferr: /* unexpected end of file is handled here with a fatal exit */
     redisLog(REDIS_WARNING,"Short read or OOM loading DB. Unrecoverable error, aborting now.");
     exit(1);
     return REDIS_ERR; /* Just to avoid warning */
+}
+
+int rdbLoad(char *filename) {
+    int retval;
+    FILE *fp;
+
+    if ((fp = fopen(filename,"r")) == NULL) return REDIS_ERR;
+    retval = rdbLoadFrom(fp);
+    fclose(fp);
+    return retval;
 }
 
 /* A background saving child (BGSAVE) terminated its work. Handle this. */

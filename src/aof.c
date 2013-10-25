@@ -470,33 +470,15 @@ void freeFakeClient(struct redisClient *c) {
     zfree(c);
 }
 
-/* Replay the append log file. On error REDIS_OK is returned. On non fatal
- * error (the append only file is zero-length) REDIS_ERR is returned. On
- * fatal error an error message is logged and the program exists. */
-int loadAppendOnlyFile(char *filename) {
+/* Replay the append logs. No error REDIS_OK is returned. On fatal
+ * error an error message is logged and the program exit. */
+int loadAppendOnlyFrom(FILE *fp) {
     struct redisClient *fakeClient;
-    FILE *fp = fopen(filename,"r");
-    struct redis_stat sb;
-    int old_aof_state = server.aof_state;
     long loops = 0;
-
-    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
-        server.aof_current_size = 0;
-        fclose(fp);
-        return REDIS_ERR;
-    }
-
-    if (fp == NULL) {
-        redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
-        exit(1);
-    }
-
-    /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
-     * to the same file we're about to read. */
-    server.aof_state = REDIS_AOF_OFF;
+    int loading = server.loading;
 
     fakeClient = createFakeClient();
-    startLoading(fp);
+    if (!loading) startLoading(fp);
 
     while(1) {
         int argc, j;
@@ -560,12 +542,8 @@ int loadAppendOnlyFile(char *filename) {
      * If the client is in the middle of a MULTI/EXEC, log error and quit. */
     if (fakeClient->flags & REDIS_MULTI) goto readerr;
 
-    fclose(fp);
     freeFakeClient(fakeClient);
-    server.aof_state = old_aof_state;
-    stopLoading();
-    aofUpdateCurrentSize();
-    server.aof_rewrite_base_size = server.aof_current_size;
+    if (!loading) stopLoading();
     return REDIS_OK;
 
 readerr:
@@ -577,6 +555,51 @@ readerr:
     exit(1);
 fmterr:
     redisLog(REDIS_WARNING,"Bad file format reading the append only file: make a backup of your AOF file, then use ./redis-check-aof --fix <filename>");
+    exit(1);
+}
+
+/* Replay the append log file. No error REDIS_OK is returned. On non fatal
+ * error (the append only file is zero-length) REDIS_ERR is returned. On
+ * fatal error an error message is logged and the program exit. */
+int loadAppendOnlyFile(char *filename) {
+    FILE *fp = fopen(filename,"r");
+    struct redis_stat sb;
+    int old_aof_state = server.aof_state;
+    int aofv2 = server.aof_format_v2;
+
+    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
+        server.aof_current_size = 0;
+        fclose(fp);
+        return REDIS_ERR;
+    }
+
+    if (fp == NULL) {
+        redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
+        exit(1);
+    }
+
+    /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
+     * to the same file we're about to read. */
+    server.aof_state = REDIS_AOF_OFF;
+
+    if (aofv2) startLoading(fp);
+    if (aofv2 && rdbLoadFrom(fp) != REDIS_OK) {
+        /* fallback to aofv1 */
+        if (fseek(fp, 0L, SEEK_SET) == -1) goto serr;
+    }
+
+    /* Load aof parts */
+    loadAppendOnlyFrom(fp);
+
+    fclose(fp);
+    server.aof_state = old_aof_state;
+    if (aofv2) stopLoading();
+    aofUpdateCurrentSize();
+    server.aof_rewrite_base_size = server.aof_current_size;
+    return REDIS_OK;
+
+serr:
+    redisLog(REDIS_WARNING,"Can't seeking the append only file on fallback to AOFv1 mode: %s", strerror(errno));
     exit(1);
 }
 
@@ -830,29 +853,18 @@ int rewriteHashObject(rio *r, robj *key, robj *o) {
 }
 
 /* Write a sequence of commands able to fully rebuild the dataset into
- * "filename". Used both by REWRITEAOF and BGREWRITEAOF.
+ * "stream". Used both by REWRITEAOF and BGREWRITEAOF.
  *
  * In order to minimize the number of commands needed in the rewritten
  * log Redis uses variadic commands when possible, such as RPUSH, SADD
  * and ZADD. However at max REDIS_AOF_REWRITE_ITEMS_PER_CMD items per time
  * are inserted using a single command. */
-int rewriteAppendOnlyFile(char *filename) {
+int rewriteAppendOnlyTo(FILE *fp) {
     dictIterator *di = NULL;
     dictEntry *de;
     rio aof;
-    FILE *fp;
-    char tmpfile[256];
     int j;
     long long now = mstime();
-
-    /* Note that we have to use a different temp name here compared to the
-     * one used by rewriteAppendOnlyFileBackground() function. */
-    snprintf(tmpfile,256,"temp-rewriteaof-%d.aof", (int) getpid());
-    fp = fopen(tmpfile,"w");
-    if (!fp) {
-        redisLog(REDIS_WARNING, "Opening the temp file for AOF rewrite in rewriteAppendOnlyFile(): %s", strerror(errno));
-        return REDIS_ERR;
-    }
 
     rioInitWithFile(&aof,fp);
     if (server.aof_rewrite_incremental_fsync)
@@ -863,10 +875,7 @@ int rewriteAppendOnlyFile(char *filename) {
         dict *d = db->dict;
         if (dictSize(d) == 0) continue;
         di = dictGetSafeIterator(d);
-        if (!di) {
-            fclose(fp);
-            return REDIS_ERR;
-        }
+        if (!di) goto err;
 
         /* SELECT the new DB */
         if (rioWrite(&aof,selectcmd,sizeof(selectcmd)-1) == 0) goto werr;
@@ -920,6 +929,39 @@ int rewriteAppendOnlyFile(char *filename) {
     /* Make sure data will not remain on the OS's output buffers */
     fflush(fp);
     aof_fsync(fileno(fp));
+
+    return REDIS_OK;
+
+werr:
+    redisLog(REDIS_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
+err:
+    if (di) dictReleaseIterator(di);
+    return REDIS_ERR;
+}
+
+/* Write a sequence of commands able to fully rebuild the dataset into
+ * "filename". Used both by REWRITEAOF and BGREWRITEAOF.
+ *
+ * In order to minimize the number of commands needed in the rewritten
+ * log Redis uses variadic commands when possible, such as RPUSH, SADD
+ * and ZADD. However at max REDIS_AOF_REWRITE_ITEMS_PER_CMD items per time
+ * are inserted using a single command. */
+int rewriteAppendOnlyFile(char *filename) {
+    FILE *fp;
+    char tmpfile[256];
+    int aofv2 = server.aof_format_v2;
+
+    /* Note that we have to use a different temp name here compared to the
+     * one used by rewriteAppendOnlyFileBackground() function. */
+    snprintf(tmpfile,256,"temp-rewriteaof-%d.aof", (int) getpid());
+    fp = fopen(tmpfile,"w");
+    if (!fp) {
+        redisLog(REDIS_WARNING, "Opening the temp file for AOF rewrite in rewriteAppendOnlyFile(): %s", strerror(errno));
+        return REDIS_ERR;
+    }
+
+    if (aofv2 && rdbSaveTo(fp) != REDIS_OK) goto werr;
+    if (!aofv2 && rewriteAppendOnlyTo(fp) != REDIS_OK) goto werr;
     fclose(fp);
 
     /* Use RENAME to make sure the DB file is changed atomically only
@@ -935,8 +977,6 @@ int rewriteAppendOnlyFile(char *filename) {
 werr:
     fclose(fp);
     unlink(tmpfile);
-    redisLog(REDIS_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
-    if (di) dictReleaseIterator(di);
     return REDIS_ERR;
 }
 
